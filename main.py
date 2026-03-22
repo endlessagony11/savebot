@@ -62,13 +62,13 @@ def main():
         except Exception as e:
             print('DEBUG print update failed:', e)
 
-        if update.business_connection:
+        if getattr(update, 'business_connection', None):
             await handle_business_connection(update, context)
-        if update.business_message:
+        if getattr(update, 'business_message', None):
             await handle_business_message(update, context)
-        if update.deleted_business_messages:
+        if getattr(update, 'deleted_business_messages', None):
             await handle_deleted_business_messages(update, context)
-        if update.edited_business_message:
+        if getattr(update, 'edited_business_message', None):
             await handle_edited_business_message(update, context)
 
         # Обработчики для обычных сообщений (fallback)
