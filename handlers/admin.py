@@ -1,8 +1,44 @@
 import os
 import difflib
 import sqlite3
-from telegram import Update
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /start — Приветственное меню."""
+    user_name = update.effective_user.first_name
+    text = (
+        f"👋 <b>Привет, {user_name}!</b>\n\n"
+        "Я твой личный бизнес-ассистент для Telegram.\n"
+        "Я помогаю сохранять то, что может исчезнуть.\n\n"
+        "🛡 <b>Что я умею:</b>\n\n"
+        "🔥 <b>Ловлю View Once:</b>\n"
+        "Пришли мне исчезающее фото или <b>ответь</b> на него любым текстом — я сохраню его копию.\n\n"
+        "✏️ <b>История изменений:</b>\n"
+        "Если собеседник изменит сообщение, я покажу, что там было раньше.\n\n"
+        "🗑 <b>Удаленные сообщения:</b>\n"
+        "Я уведомлю тебя, если кто-то удалит сообщение в чате."
+    )
+    
+    keyboard = [[InlineKeyboardButton("📚 Инструкция по подключению", callback_data='help_instruction')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def help_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик нажатия на кнопку инструкции."""
+    query = update.callback_query
+    await query.answer()
+    
+    help_text = (
+        "⚙️ <b>Как подключить бота (нужен Telegram Premium):</b>\n\n"
+        "1. Перейдите в <b>Настройки</b> ➝ <b>Telegram Business</b>.\n"
+        "2. Выберите пункт <b>Chatbots</b> (Чат-боты).\n"
+        "3. Добавьте ссылку на этого бота в поле списка ботов.\n"
+        "4. Готово! Бот начнет сохранять сообщения из личных чатов."
+    )
+    await query.message.reply_text(help_text, parse_mode='HTML')
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /history {chat_id} — показать историю переписки."""
@@ -188,5 +224,109 @@ async def diff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(response)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
+    finally:
+        conn.close()
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /stats [chat_id] — статистика сообщений и фото."""
+    user_id = update.effective_user.id
+    chat_id = None
+    
+    if context.args:
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Неверный chat_id.")
+            return
+
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    try:
+        # Базовый запрос: считаем сообщения, привязанные к текущему бизнес-пользователю
+        base_query = """
+            SELECT COUNT(*) 
+            FROM messages m
+            JOIN business_connections bc ON m.business_connection_id = bc.connection_id
+            WHERE bc.user_id = ?
+        """
+        params = [user_id]
+        
+        if chat_id:
+            base_query += " AND m.chat_id = ?"
+            params.append(chat_id)
+            
+        # 1. Всего сообщений
+        c.execute(base_query, tuple(params))
+        total_msg = c.fetchone()[0]
+        
+        # 2. Всего картинок
+        photo_query = base_query + " AND m.content_type = 'photo'"
+        c.execute(photo_query, tuple(params))
+        total_photos = c.fetchone()[0]
+
+        # 3. Удаленных сообщений
+        deleted_query = base_query + " AND m.is_deleted = 1"
+        c.execute(deleted_query, tuple(params))
+        total_deleted = c.fetchone()[0]
+        
+        target_str = f"в чате {chat_id}" if chat_id else "всего (во всех чатах)"
+        
+        text = (
+            f"📊 <b>Статистика с момента запуска бота {target_str}:</b>\n\n"
+            f"📨 Всего записей: <b>{total_msg}</b>\n"
+            f"🗑 Удалено собеседниками: <b>{total_deleted}</b>\n"
+            f"🖼 Картинок: <b>{total_photos}</b>"
+        )
+        await update.message.reply_text(text, parse_mode='HTML')
+        
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка получения статистики: {e}")
+    finally:
+        conn.close()
+
+async def auto_clean_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фоновая задача: удаление файлов и записей старше 2 дней."""
+    days = 2
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    try:
+        cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+        # 1. Формируем "Белый список" файлов (Keep List)
+        c.execute("SELECT file_path FROM messages WHERE timestamp >= ?", (cutoff_date,))
+        keep_files = set()
+        for row in c.fetchall():
+            if row[0]:
+                keep_files.add(os.path.normpath(row[0]))
+
+        # 2. Сканируем папку storage и удаляем старое
+        deleted_files_count = 0
+        storage_dir = 'storage'
+        if os.path.exists(storage_dir):
+            for filename in os.listdir(storage_dir):
+                full_path = os.path.join(storage_dir, filename)
+                if os.path.isfile(full_path):
+                    if os.path.normpath(full_path) not in keep_files:
+                        try:
+                            os.remove(full_path)
+                            deleted_files_count += 1
+                        except Exception as e:
+                            print(f"Auto-clean error deleting {filename}: {e}")
+
+        # 3. Удаляем старые записи из БД
+        c.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff_date,))
+        deleted_msgs = c.rowcount
+        c.execute("DELETE FROM message_edits WHERE edited_at < ?", (cutoff_date,))
+        deleted_edits = c.rowcount
+
+        # 4. Сжимаем БД
+        if deleted_files_count > 0 or deleted_msgs > 0:
+            c.execute("VACUUM")
+            print(f"[Auto-Clean] Удалено: {deleted_files_count} файлов, {deleted_msgs} сообщений, {deleted_edits} правок.")
+        
+        conn.commit()
+
+    except Exception as e:
+        print(f"[Auto-Clean] Ошибка при очистке: {e}")
     finally:
         conn.close()

@@ -3,7 +3,7 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, TypeHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, TypeHandler, CallbackQueryHandler
 
 # Принудительная загрузка .env из папки со скриптом
 env_path = Path(__file__).resolve().parent / '.env'
@@ -26,7 +26,11 @@ from handlers.admin import (
     deleted_command,
     connections_command,
     edits_command,
-    diff_command
+    diff_command,
+    start_command,
+    help_callback_handler,
+    stats_command,
+    auto_clean_job
 )
 from database.models import init_db
 
@@ -74,11 +78,14 @@ def main():
             await handle_regular_edited_message(update, context)
 
     # Регистрация команд администратора
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CallbackQueryHandler(help_callback_handler, pattern='^help_instruction$'))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("deleted", deleted_command))
     app.add_handler(CommandHandler("connections", connections_command))
     app.add_handler(CommandHandler("edits", edits_command))
     app.add_handler(CommandHandler("diff", diff_command))
+    app.add_handler(CommandHandler("stats", stats_command))
 
     # Глобальный обработчик всех событий (бизнес-сообщения, удаления, правки).
     # Добавляем В КОНЦЕ, чтобы он не перехватывал команды админа.
@@ -86,6 +93,12 @@ def main():
 
     # Запуск в polling (локальная отладка)
     print("Бот запущен в режиме polling.")
+
+    # Настройка автоматической очистки (каждые 24 часа = 86400 секунд)
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_clean_job, interval=86400, first=10)
+        print("Автоматическая очистка включена (интервал: 24ч, удаление старше 2 дней).")
+
     app.run_polling()
 
     # Для webhook-режима используйте код ниже, вместо run_polling():

@@ -1,11 +1,9 @@
-import asyncio
 import os
 import sqlite3
 from datetime import datetime
-from telegram import Update
+from html import escape
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-
-PHOTO_TTL_SECONDS = int(os.getenv('PHOTO_TTL_SECONDS', '10'))
 
 def get_owner_user_id(conn, business_connection_id):
     if not business_connection_id:
@@ -16,49 +14,55 @@ def get_owner_user_id(conn, business_connection_id):
     return row[0] if row else None
 
 
-async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
-    """Удаляет сообщение бота через заданное число секунд."""
-    try:
-        await asyncio.sleep(delay)
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        print(f"Can't auto-delete message {message_id} in chat {chat_id}: {e}")
+def format_text_block(text: str | None, empty_text: str = "Без текста") -> str:
+    value = (text or "").strip()
+    if not value:
+        value = empty_text
+    return escape(value).replace("\n", "<br>")
 
 
-async def send_self_destructing_photo(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    photo_path: str,
-    caption: str | None = None,
-    ttl_seconds: int = PHOTO_TTL_SECONDS,
-) -> None:
-    """Отправляет фото и планирует его автоудаление."""
-    with open(photo_path, 'rb') as photo:
-        sent_message = await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=photo,
-            caption=caption,
-        )
+def build_card_message(
+    icon: str,
+    title: str,
+    user_name: str | None = None,
+    username: str | None = None,
+    sections: list[tuple[str, str | None]] | None = None,
+    footer: str | None = None,
+) -> str:
+    parts = [f"{icon} <b>{escape(title)}</b>"]
 
-    if ttl_seconds > 0:
-        asyncio.create_task(
-            delete_message_after_delay(
-                context=context,
-                chat_id=chat_id,
-                message_id=sent_message.message_id,
-                delay=ttl_seconds,
-            )
-        )
+    if user_name or username:
+        safe_name = escape(user_name or "Неизвестный пользователь")
+        if username:
+            parts.append(f"Пользователь: <b>{safe_name}</b>\nЮзернейм: @{escape(username)}")
+        else:
+            parts.append(f"Пользователь: <b>{safe_name}</b>\nЮзернейм: <i>не указан</i>")
+
+    if sections:
+        for label, value in sections:
+            parts.append(f"{escape(label)}:\n<blockquote>{format_text_block(value)}</blockquote>")
+
+    if footer:
+        parts.append(f"<i>{escape(footer)}</i>")
+
+    return "\n\n".join(parts)
 
 async def handle_regular_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
     owner_chat = update.message.chat_id
-    text = update.message.text or '<не текст>'
+    text = update.message.text or "Без текста"
     await context.bot.send_message(
         chat_id=owner_chat,
-        text=f"🟢 Новое сообщение от собеседника:\n{text}"
+        text=build_card_message(
+            icon="💬",
+            title="Новое сообщение",
+            user_name=update.message.from_user.full_name if update.message.from_user else None,
+            username=update.message.from_user.username if update.message.from_user else None,
+            sections=[("Текст", text)],
+        ),
+        parse_mode='HTML'
     )
 
 async def handle_regular_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -66,10 +70,17 @@ async def handle_regular_edited_message(update: Update, context: ContextTypes.DE
         return
 
     owner_chat = update.edited_message.chat_id
-    new_text = update.edited_message.text or '<не текст>'
+    new_text = update.edited_message.text or "Без текста"
     await context.bot.send_message(
         chat_id=owner_chat,
-        text=f"✏️ Сообщение отредактировано:\n{new_text}"
+        text=build_card_message(
+            icon="✏️",
+            title="Сообщение изменено",
+            user_name=update.edited_message.from_user.full_name if update.edited_message.from_user else None,
+            username=update.edited_message.from_user.username if update.edited_message.from_user else None,
+            sections=[("Новый текст", new_text)],
+        ),
+        parse_mode='HTML'
     )
 
 async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,7 +119,11 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     # Определение типа контента и file_id
     content_type = 'text'
     file_id = None
+    is_from_reply = False
     text = business_message.text or business_message.caption
+
+    # Проверка на защищенный контент (View Once часто имеет этот флаг)
+    is_protected = getattr(business_message, 'has_protected_content', False)
 
     if business_message.photo:
         content_type = 'photo'
@@ -131,9 +146,39 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     elif business_message.sticker:
         content_type = 'sticker'
         file_id = business_message.sticker.file_id
-    # Добавьте другие типы по необходимости
+
+    # Если в самом сообщении нет файла, проверяем reply_to_message
+    # Это нужно, чтобы поймать View Once медиа при ответе на них
+    if not file_id and getattr(business_message, 'reply_to_message', None):
+        is_from_reply = True
+        reply = business_message.reply_to_message
+        # Обновляем статус защиты (он может быть True у оригинального сообщения)
+        is_protected = getattr(reply, 'has_protected_content', False)
+
+        if reply.photo:
+            content_type = 'photo'
+            file_id = reply.photo[-1].file_id
+        elif reply.document:
+            content_type = 'document'
+            file_id = reply.document.file_id
+        elif reply.audio:
+            content_type = 'audio'
+            file_id = reply.audio.file_id
+        elif reply.video:
+            content_type = 'video'
+            file_id = reply.video.file_id
+        elif reply.voice:
+            content_type = 'voice'
+            file_id = reply.voice.file_id
+        elif reply.video_note:
+            content_type = 'video_note'
+            file_id = reply.video_note.file_id
+        elif reply.sticker:
+            content_type = 'sticker'
+            file_id = reply.sticker.file_id
 
     file_path = None
+    download_error = None
     if file_id:
         try:
             file = await context.bot.get_file(file_id)
@@ -144,6 +189,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             await file.download_to_drive(file_path)
         except Exception as e:
             print(f"Error downloading file {file_id}: {e}")
+            download_error = str(e)
             file_path = None
 
     # Сохранение в БД
@@ -163,70 +209,149 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     finally:
         conn.close()
 
+    # --- ЛОГИКА ПЕРЕСЫЛКИ (SAVE AIO LIKE) ---
+    conn = sqlite3.connect('database.db')
+    owner_id = get_owner_user_id(conn, business_connection_id)
+    conn.close()
+
+    # Пересылаем ТОЛЬКО если это ответ на медиа (ручное сохранение)
+    if owner_id and business_message.from_user and is_from_reply:
+        sender_name = business_message.from_user.full_name
+
+        # 1. Если файл успешно скачан — отправляем его
+        if file_path and os.path.exists(file_path):
+            try:
+                caption_text = build_card_message(
+                    icon="📥",
+                    title="Поймано медиа",
+                    user_name=sender_name,
+                    username=business_message.from_user.username,
+                    sections=[("Подпись", text)] if text else None,
+                )
+
+                with open(file_path, 'rb') as f:
+                    if content_type == 'photo':
+                        await context.bot.send_photo(chat_id=owner_id, photo=f, caption=caption_text, parse_mode='HTML')
+                    elif content_type == 'video':
+                        await context.bot.send_video(chat_id=owner_id, video=f, caption=caption_text, parse_mode='HTML')
+                    elif content_type == 'voice':
+                        await context.bot.send_voice(chat_id=owner_id, voice=f, caption=caption_text, parse_mode='HTML')
+                    elif content_type == 'video_note':
+                        await context.bot.send_video_note(chat_id=owner_id, video_note=f)
+                    elif content_type == 'audio':
+                         await context.bot.send_audio(chat_id=owner_id, audio=f, caption=caption_text, parse_mode='HTML')
+                    elif content_type == 'document':
+                         await context.bot.send_document(chat_id=owner_id, document=f, caption=caption_text, parse_mode='HTML')
+                    elif content_type == 'sticker':
+                         await context.bot.send_sticker(chat_id=owner_id, sticker=f)
+            except Exception as e:
+                print(f"Error forwarding view once/media to owner: {e}")
+        
+        # 2. Если файл был, но скачать не удалось (например, защита View Once)
+        elif file_id and download_error:
+            try:
+                failure_reason = (
+                    "Файл защищён: Telegram API не даёт скачать такое view once медиа."
+                    if is_protected
+                    else f"Ошибка загрузки: {download_error}"
+                )
+                sections = [("Причина", failure_reason)]
+                if text:
+                    sections.append(("Подпись", text))
+
+                error_text = build_card_message(
+                    icon="⚠️",
+                    title="Медиа не сохранено",
+                    user_name=sender_name,
+                    username=business_message.from_user.username,
+                    sections=sections,
+                )
+                    
+                await context.bot.send_message(chat_id=owner_id, text=error_text, parse_mode='HTML')
+            except Exception as e:
+                print(f"Error sending error notification: {e}")
+
 async def handle_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик для deleted_business_messages: отправка содержимого удалённых сообщений администратору."""
     deleted_event = update.deleted_business_messages
     if not deleted_event:
         return
 
-    business_connection_id = None
-    if update.business_connection:
-        business_connection_id = update.business_connection.id
-    elif hasattr(update, 'business_message') and update.business_message and getattr(update.business_message, 'business_connection_id', None):
-        business_connection_id = update.business_message.business_connection_id
-    else:
-        print('Warning: deleted_business_messages received without business_connection, will try fallback by message_id')
     business_connection_id = deleted_event.business_connection_id
     message_ids = deleted_event.message_ids
+    event_chat_id = deleted_event.chat.id
 
     conn = sqlite3.connect('database.db')
+    # Определяем владельца подключения заранее, чтобы знать куда слать уведомления
+    owner_id = get_owner_user_id(conn, business_connection_id)
     c = conn.cursor()
+
     try:
         for msg_id in message_ids:
-            if business_connection_id:
-                c.execute("SELECT content_type, text, file_path, chat_id FROM messages WHERE business_connection_id = ? AND message_id = ?",
-                          (business_connection_id, msg_id))
-            else:
-                c.execute("SELECT content_type, text, file_path, chat_id, business_connection_id FROM messages WHERE message_id = ?",
-                          (msg_id,))
+            # Ищем удаляемое сообщение в нашей базе данных
+            c.execute("SELECT content_type, text, file_path, chat_id, from_user_id FROM messages WHERE business_connection_id = ? AND message_id = ?",
+                      (business_connection_id, msg_id))
             row = c.fetchone()
+
+            # Определяем чат для уведомления (владелец бота или ID чата события)
+            target_chat = owner_id or event_chat_id
+
             if row:
-                if business_connection_id:
-                    content_type, text, file_path, chat_id = row
-                else:
-                    content_type, text, file_path, chat_id, business_connection_id = row
+                content_type, text, file_path, db_chat_id, from_user_id = row
 
-                owner_id = get_owner_user_id(conn, business_connection_id)
-                target_chat = owner_id or chat_id
+                # Получаем информацию о пользователе для красивого уведомления
+                user_name = "Неизвестный"
+                user_handle_str = ""
+                button_url = None
 
-                text_to_send = f"🗑 Удалено\nID: {msg_id}\nТип: {content_type}\nТекст: {text or 'Нет текста'}"
+                if from_user_id:
+                    try:
+                        chat_info = await context.bot.get_chat(from_user_id)
+                        user_name = chat_info.full_name
+                        if chat_info.username:
+                            user_handle_str = chat_info.username
+                            button_url = f"https://t.me/{chat_info.username}"
+                        else:
+                            button_url = f"tg://user?id={from_user_id}"
+                    except Exception:
+                        user_name = "Пользователь"
+                        button_url = f"tg://user?id={from_user_id}"
+
+                text_to_send = build_card_message(
+                    icon="♻️",
+                    title="Сообщение удалено",
+                    user_name=user_name,
+                    username=user_handle_str or None,
+                    sections=[("Удалённый текст", text or "Только медиа")],
+                )
+
+                reply_markup = None
+                if button_url:
+                    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
 
                 # Отправка пользователю, под чей бизнес-аккаунт подключён бот
                 try:
                     if file_path and os.path.exists(file_path):
-                        if content_type == 'photo':
-                            await send_self_destructing_photo(
-                                context=context,
-                                chat_id=target_chat,
-                                photo_path=file_path,
-                                caption=text_to_send,
-                            )
-                        else:
-                            with open(file_path, 'rb') as f:
-                                await context.bot.send_document(chat_id=target_chat, document=f, caption=text_to_send)
+                        with open(file_path, 'rb') as f:
+                            if content_type == 'photo':
+                                await context.bot.send_photo(chat_id=target_chat, photo=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
+                            elif content_type == 'video':
+                                await context.bot.send_video(chat_id=target_chat, video=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
+                            elif content_type == 'voice':
+                                await context.bot.send_voice(chat_id=target_chat, voice=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
+                            else:
+                                await context.bot.send_document(chat_id=target_chat, document=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
                     else:
-                        await context.bot.send_message(chat_id=target_chat, text=text_to_send)
+                        await context.bot.send_message(chat_id=target_chat, text=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
                 except Exception as e:
                     print(f"Can't notify owner {target_chat}: {e}")
 
-                if business_connection_id:
-                    c.execute("UPDATE messages SET is_deleted = 1 WHERE business_connection_id = ? AND message_id = ?", (business_connection_id, msg_id))
-                else:
-                    c.execute("UPDATE messages SET is_deleted = 1 WHERE message_id = ?", (msg_id,))
+                c.execute("UPDATE messages SET is_deleted = 1 WHERE business_connection_id = ? AND message_id = ?", (business_connection_id, msg_id))
             else:
-                missing_text = f"🗑 Удалено сообщение {msg_id}, но запись не найдена в БД"
-                target_chat = owner_id if 'owner_id' in locals() and owner_id else chat_id
-                # await context.bot.send_message(chat_id=target_chat, text=missing_text) # Опционально, чтобы не спамить
+                # Сообщения нет в базе (возможно, оно было отправлено до установки бота)
+                # Мы не можем его переслать, так как у нас нет его содержимого.
+                print(f"Message {msg_id} not found in DB for deletion (skipped).")
+        
         conn.commit()
     except Exception as e:
         print(f"Error handling deleted messages: {e}")
@@ -293,19 +418,29 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
         owner_id = get_owner_user_id(conn, business_connection_id)
         target_chat = owner_id or chat_id
 
-        user = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
-        timestamp = edited_message.edit_date.strftime('%Y-%m-%d %H:%M:%S')
-        notification_text = f"""✏️ Сообщение отредактировано
-👤 От: {user}  |  💬 Чат: {chat_id}
-━━━━━━━━━━━━━━
-Было: {old_text or 'Нет текста'}
-Стало: {new_text or 'Нет текста'}
-━━━━━━━━━━━━━━
-🕐 {timestamp}  |  Правка #{new_edit_count}"""
+        user_name = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
+        username = edited_message.from_user.username
+        timestamp = edited_message.edit_date.strftime('%H:%M') if edited_message.edit_date else None
+
+        notification_text = build_card_message(
+            icon="♻️",
+            title="Пользователь изменил(а) сообщение",
+            user_name=user_name,
+            username=username,
+            sections=[
+                ("Старый текст", old_text),
+                ("Новый текст", new_text),
+            ],
+            footer=timestamp,
+        )
+
+        # Кнопка перехода в чат
+        button_url = f"https://t.me/{username}" if username else f"tg://user?id={edited_message.from_user.id}"
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
 
         # В чат владельца (или в chat_id, если нет owner_id)
         try:
-            await context.bot.send_message(chat_id=target_chat, text=notification_text)
+            await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='HTML', reply_markup=reply_markup)
         except Exception as ex:
             print(f"Can't send edit notification to target {target_chat}: {ex}")
 
