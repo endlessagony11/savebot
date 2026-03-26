@@ -236,19 +236,19 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
 
                 with open(file_path, 'rb') as f:
                     if content_type == 'photo':
-                        await context.bot.send_photo(chat_id=owner_id, photo=f, caption=caption_text, parse_mode='HTML')
+                        await context.bot.send_photo(chat_id=business_message.chat.id, photo=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'video':
-                        await context.bot.send_video(chat_id=owner_id, video=f, caption=caption_text, parse_mode='HTML')
+                        await context.bot.send_video(chat_id=business_message.chat.id, video=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'voice':
-                        await context.bot.send_voice(chat_id=owner_id, voice=f, caption=caption_text, parse_mode='HTML')
+                        await context.bot.send_voice(chat_id=business_message.chat.id, voice=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'video_note':
-                        await context.bot.send_video_note(chat_id=owner_id, video_note=f)
+                        await context.bot.send_video_note(chat_id=business_message.chat.id, video_note=f)
                     elif content_type == 'audio':
-                         await context.bot.send_audio(chat_id=owner_id, audio=f, caption=caption_text, parse_mode='HTML')
+                         await context.bot.send_audio(chat_id=business_message.chat.id, audio=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'document':
-                         await context.bot.send_document(chat_id=owner_id, document=f, caption=caption_text, parse_mode='HTML')
+                         await context.bot.send_document(chat_id=business_message.chat.id, document=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'sticker':
-                         await context.bot.send_sticker(chat_id=owner_id, sticker=f)
+                         await context.bot.send_sticker(chat_id=business_message.chat.id, sticker=f)
             except Exception as e:
                 print(f"Error forwarding view once/media to owner: {e}")
         
@@ -272,7 +272,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                     sections=sections,
                 )
                     
-                await context.bot.send_message(chat_id=owner_id, text=error_text, parse_mode='HTML')
+                await context.bot.send_message(chat_id=business_message.chat.id, text=error_text, parse_mode='HTML')
             except Exception as e:
                 print(f"Error sending error notification: {e}")
 
@@ -287,8 +287,6 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     event_chat_id = deleted_event.chat.id
 
     conn = sqlite3.connect('database.db')
-    # Определяем владельца подключения заранее, чтобы знать куда слать уведомления
-    owner_id = get_owner_user_id(conn, business_connection_id)
     c = conn.cursor()
 
     try:
@@ -298,8 +296,8 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
                       (business_connection_id, msg_id))
             row = c.fetchone()
 
-            # Определяем чат для уведомления (владелец бота или ID чата события)
-            target_chat = owner_id or event_chat_id
+            # Отправляем уведомление в чат события (где произошло удаление)
+            target_chat = event_chat_id
 
             if row:
                 content_type, text, file_path, db_chat_id, from_user_id = row
@@ -419,14 +417,16 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
                   (new_text, new_file_id, new_edit_count, business_connection_id, edited_message.message_id))
         conn.commit()
 
-        # Отправить уведомления владельцу и администратору
+        # Получить ID владельца для проверки (не изменил ли он сам)
         owner_id = get_owner_user_id(conn, business_connection_id)
-        target_chat = owner_id or chat_id
-
+        
         # Проверяем, изменил ли сообщение владелец бота (себя)
         if edited_message.from_user and edited_message.from_user.id == owner_id:
             # Изменение от владельца — не отправляем уведомление
             return
+        
+        # Отправляем уведомление в чат события
+        target_chat = chat_id
 
         user_name = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
         username = edited_message.from_user.username
