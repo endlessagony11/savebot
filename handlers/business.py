@@ -236,21 +236,23 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
 
                 with open(file_path, 'rb') as f:
                     if content_type == 'photo':
-                        await context.bot.send_photo(chat_id=business_message.chat.id, photo=f, caption=caption_text, parse_mode='HTML')
+                        await context.bot.send_photo(chat_id=owner_id, photo=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'video':
-                        await context.bot.send_video(chat_id=business_message.chat.id, video=f, caption=caption_text, parse_mode='HTML')
+                        await context.bot.send_video(chat_id=owner_id, video=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'voice':
-                        await context.bot.send_voice(chat_id=business_message.chat.id, voice=f, caption=caption_text, parse_mode='HTML')
+                        await context.bot.send_voice(chat_id=owner_id, voice=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'video_note':
-                        await context.bot.send_video_note(chat_id=business_message.chat.id, video_note=f)
+                        await context.bot.send_video_note(chat_id=owner_id, video_note=f)
                     elif content_type == 'audio':
-                         await context.bot.send_audio(chat_id=business_message.chat.id, audio=f, caption=caption_text, parse_mode='HTML')
+                         await context.bot.send_audio(chat_id=owner_id, audio=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'document':
-                         await context.bot.send_document(chat_id=business_message.chat.id, document=f, caption=caption_text, parse_mode='HTML')
+                         await context.bot.send_document(chat_id=owner_id, document=f, caption=caption_text, parse_mode='HTML')
                     elif content_type == 'sticker':
-                         await context.bot.send_sticker(chat_id=business_message.chat.id, sticker=f)
+                         await context.bot.send_sticker(chat_id=owner_id, sticker=f)
             except Exception as e:
-                print(f"Error forwarding view once/media to owner: {e}")
+                # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
+                if "Forbidden" not in str(e):
+                    print(f"Error forwarding media to owner: {e}")
         
         # 2. Если файл был, но скачать не удалось (например, защита View Once)
         elif file_id and download_error:
@@ -272,9 +274,11 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                     sections=sections,
                 )
                     
-                await context.bot.send_message(chat_id=business_message.chat.id, text=error_text, parse_mode='HTML')
+                await context.bot.send_message(chat_id=owner_id, text=error_text, parse_mode='HTML')
             except Exception as e:
-                print(f"Error sending error notification: {e}")
+                # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
+                if "Forbidden" not in str(e):
+                    print(f"Error sending error notification: {e}")
 
 async def handle_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик для deleted_business_messages: отправка содержимого удалённых сообщений администратору."""
@@ -287,23 +291,18 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     event_chat_id = deleted_event.chat.id
 
     conn = sqlite3.connect('database.db')
+    owner_id = get_owner_user_id(conn, business_connection_id)
     c = conn.cursor()
 
     try:
-        # Проверяем, приватный ли это чат (бот не может инициировать диалог в приватных чатах)
-        if deleted_event.chat.type.name == 'PRIVATE':
-            # Приватный чат — уведомления не отправляем
-            print(f"[Deleted] Private chat {event_chat_id} - skipping notifications")
-            return
-        
         for msg_id in message_ids:
             # Ищем удаляемое сообщение в нашей базе данных
             c.execute("SELECT content_type, text, file_path, chat_id, from_user_id FROM messages WHERE business_connection_id = ? AND message_id = ?",
                       (business_connection_id, msg_id))
             row = c.fetchone()
 
-            # Отправляем уведомление в чат события (где произошло удаление)
-            target_chat = event_chat_id
+            # Отправляем уведомление владельцу бота
+            target_chat = owner_id
 
             if row:
                 content_type, text, file_path, db_chat_id, from_user_id = row
@@ -338,7 +337,7 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
                 if button_url:
                     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
 
-                # Отправка пользователю, под чей бизнес-аккаунт подключён бот
+                # Отправка владельцу бота на приватный чат
                 try:
                     if file_path and os.path.exists(file_path):
                         with open(file_path, 'rb') as f:
@@ -353,7 +352,9 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
                     else:
                         await context.bot.send_message(chat_id=target_chat, text=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
                 except Exception as e:
-                    print(f"Can't notify owner {target_chat}: {e}")
+                    # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
+                    if "Forbidden" not in str(e):
+                        print(f"Error notifying owner: {e}")
 
                 c.execute("UPDATE messages SET is_deleted = 1 WHERE business_connection_id = ? AND message_id = ?", (business_connection_id, msg_id))
             else:
@@ -431,12 +432,8 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
             # Изменение от владельца — не отправляем уведомление
             return
         
-        # Проверяем, приватный ли это чат (бот не может инициировать диалог в приватных чатах)
-        if edited_message.chat.type.name == 'PRIVATE':
-            # Приватный чат — уведомление не отправляем (Telegram не позволит)
-            return
-
-        target_chat = chat_id
+        # Отправляем уведомление владельцу бота на его приватный чат
+        target_chat = owner_id
 
         user_name = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
         username = edited_message.from_user.username
@@ -458,11 +455,13 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
         button_url = f"https://t.me/{username}" if username else f"tg://user?id={edited_message.from_user.id}"
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
 
-        # Отправляем в чат события
+        # Отправляем в приватный чат владельца
         try:
             await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='HTML', reply_markup=reply_markup)
         except Exception as ex:
-            print(f"Error sending edit notification: {ex}")
+            # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
+            if "Forbidden" not in str(ex):
+                print(f"Error sending edit notification: {ex}")
 
     except Exception as e:
         print(f"Error handling edited message: {e}")
