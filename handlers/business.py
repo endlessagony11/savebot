@@ -290,6 +290,12 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     c = conn.cursor()
 
     try:
+        # Проверяем, приватный ли это чат (бот не может инициировать диалог в приватных чатах)
+        if deleted_event.chat.type.name == 'PRIVATE':
+            # Приватный чат — уведомления не отправляем
+            print(f"[Deleted] Private chat {event_chat_id} - skipping notifications")
+            return
+        
         for msg_id in message_ids:
             # Ищем удаляемое сообщение в нашей базе данных
             c.execute("SELECT content_type, text, file_path, chat_id, from_user_id FROM messages WHERE business_connection_id = ? AND message_id = ?",
@@ -425,7 +431,11 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
             # Изменение от владельца — не отправляем уведомление
             return
         
-        # Отправляем уведомление в чат события
+        # Проверяем, приватный ли это чат (бот не может инициировать диалог в приватных чатах)
+        if edited_message.chat.type.name == 'PRIVATE':
+            # Приватный чат — уведомление не отправляем (Telegram не позволит)
+            return
+
         target_chat = chat_id
 
         user_name = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
@@ -448,11 +458,11 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
         button_url = f"https://t.me/{username}" if username else f"tg://user?id={edited_message.from_user.id}"
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
 
-        # В чат владельца (или в chat_id, если нет owner_id)
+        # Отправляем в чат события
         try:
             await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='HTML', reply_markup=reply_markup)
         except Exception as ex:
-            print(f"Can't send edit notification to target {target_chat}: {ex}")
+            print(f"Error sending edit notification: {ex}")
 
     except Exception as e:
         print(f"Error handling edited message: {e}")
