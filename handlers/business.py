@@ -100,6 +100,7 @@ async def handle_business_connection(update: Update, context: ContextTypes.DEFAU
         c.execute("INSERT INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
                   (business_connection.id, business_connection.user.id, business_connection.date))
         conn.commit()
+        print(f"✓ Saved business_connection: {business_connection.id} -> user {business_connection.user.id}")
     except Exception as e:
         print(f"Error saving business connection: {e}")
     finally:
@@ -292,6 +293,12 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
 
     conn = sqlite3.connect('database.db')
     owner_id = get_owner_user_id(conn, business_connection_id)
+    
+    # Если owner_id не найден, используем event_chat_id
+    if not owner_id:
+        owner_id = event_chat_id
+        print(f'Warning: owner_id not found for connection {business_connection_id}. Using event_chat_id {event_chat_id}')
+    
     c = conn.cursor()
 
     try:
@@ -426,6 +433,23 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
 
         # Получить ID владельца для проверки (не изменил ли он сам)
         owner_id = get_owner_user_id(conn, business_connection_id)
+        
+        # Если owner_id не найден, может быть соединение не было сохранено
+        if not owner_id:
+            # Пытаемся получить из update.business_connection если есть
+            if update.business_connection and update.business_connection.user:
+                owner_id = update.business_connection.user.id
+                # Сохраняем соединение
+                try:
+                    c.execute("INSERT INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
+                              (business_connection_id, owner_id, edited_message.date))
+                    conn.commit()
+                    print(f'Auto-saved business_connection: {business_connection_id} -> user {owner_id}')
+                except Exception as e:
+                    print(f'Error auto-saving connection: {e}')
+            else:
+                print(f'Warning: owner_id not found for connection {business_connection_id}. Check if business_connection was saved to database.')
+                return
         
         # Проверяем, изменил ли сообщение владелец бота (себя)
         if edited_message.from_user and edited_message.from_user.id == owner_id:
