@@ -29,8 +29,7 @@ from handlers.admin import (
     diff_command,
     start_command,
     help_callback_handler,
-    stats_command,
-    auto_clean_job
+    stats_command
 )
 from database.models import init_db
 
@@ -93,11 +92,6 @@ def main():
 
     # Запуск в polling (локальная отладка)
     print("Бот запущен в режиме polling.")
-
-    # Настройка автоматической очистки (каждые 24 часа = 86400 секунд)
-    if app.job_queue:
-        app.job_queue.run_repeating(auto_clean_job, interval=86400, first=10)
-        print("Автоматическая очистка включена (интервал: 24ч, удаление старше 2 дней).")
 
     app.run_polling()
 

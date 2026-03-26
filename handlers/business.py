@@ -70,6 +70,11 @@ async def handle_regular_edited_message(update: Update, context: ContextTypes.DE
         return
 
     owner_chat = update.edited_message.chat_id
+    # Проверяем, изменил ли сообщение сам владелец чата
+    if update.edited_message.from_user and update.edited_message.from_user.id == owner_chat:
+        # Изменение от владельца — не отправляем уведомление
+        return
+
     new_text = update.edited_message.text or "Без текста"
     await context.bot.send_message(
         chat_id=owner_chat,
@@ -417,6 +422,11 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
         # Отправить уведомления владельцу и администратору
         owner_id = get_owner_user_id(conn, business_connection_id)
         target_chat = owner_id or chat_id
+
+        # Проверяем, изменил ли сообщение владелец бота (себя)
+        if edited_message.from_user and edited_message.from_user.id == owner_id:
+            # Изменение от владельца — не отправляем уведомление
+            return
 
         user_name = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
         username = edited_message.from_user.username
