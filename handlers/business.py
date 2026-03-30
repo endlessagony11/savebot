@@ -116,8 +116,35 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     business_connection_id = None
     if update.business_connection:
         business_connection_id = update.business_connection.id
+        # Сохраняем business_connection в БД, если его нет
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        try:
+            c.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
+                      (business_connection_id, update.business_connection.user.id, business_message.date))
+            conn.commit()
+            print(f"✓ Saved business_connection from business_message: {business_connection_id} -> user {update.business_connection.user.id}")
+        except Exception as e:
+            print(f"Error saving business connection from business_message: {e}")
+        finally:
+            conn.close()
     elif getattr(business_message, 'business_connection_id', None):
         business_connection_id = business_message.business_connection_id
+
+        # Если записи в business_connections нет, создаем автоматом (fallback)
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        try:
+            existing_owner = get_owner_user_id(conn, business_connection_id)
+            if not existing_owner:
+                c.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
+                          (business_connection_id, business_message.chat.id, business_message.date))
+                conn.commit()
+                print(f"✓ Auto-saved business_connection from business_message: {business_connection_id} -> user {business_message.chat.id}")
+        except Exception as e:
+            print(f"Error auto-saving business connection from business_message: {e}")
+        finally:
+            conn.close()
     else:
         print('Warning: business_message received without business_connection, skipping')
         return
@@ -434,28 +461,22 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
         # Получить ID владельца для проверки (не изменил ли он сам)
         owner_id = get_owner_user_id(conn, business_connection_id)
         
-        # Если owner_id не найден, может быть соединение не было сохранено
+        # Если owner_id не найден, используем event_chat_id и сохраняем fallback
         if not owner_id:
-            # Пытаемся получить из update.business_connection если есть
-            if update.business_connection and update.business_connection.user:
-                owner_id = update.business_connection.user.id
-                # Сохраняем соединение
-                try:
-                    c.execute("INSERT INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
-                              (business_connection_id, owner_id, edited_message.date))
-                    conn.commit()
-                    print(f'Auto-saved business_connection: {business_connection_id} -> user {owner_id}')
-                except Exception as e:
-                    print(f'Error auto-saving connection: {e}')
-            else:
-                print(f'Warning: owner_id not found for connection {business_connection_id}. Check if business_connection was saved to database.')
-                return
-        
+            owner_id = edited_message.chat.id
+            try:
+                c.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
+                          (business_connection_id, owner_id, edited_message.date))
+                conn.commit()
+                print(f"Warning: owner_id not found for connection {business_connection_id}. Auto-saved to {owner_id}")
+            except Exception as e:
+                print(f"Error auto-saving connection in edited_business_message: {e}")
+
         # Проверяем, изменил ли сообщение владелец бота (себя)
         if edited_message.from_user and edited_message.from_user.id == owner_id:
             # Изменение от владельца — не отправляем уведомление
             return
-        
+
         # Отправляем уведомление владельцу бота на его приватный чат
         target_chat = owner_id
 
