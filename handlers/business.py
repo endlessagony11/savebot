@@ -1,19 +1,51 @@
 import os
 import sqlite3
+import asyncio
 from datetime import datetime
 from html import escape
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from capability.save import cleanup_save_command_message
+from capability.save import cleanup_save_command_message, is_save_command
+
 
 def get_owner_user_id(conn, business_connection_id):
     if not business_connection_id:
         return None
     c = conn.cursor()
-    c.execute("SELECT user_id FROM business_connections WHERE connection_id = ?", (business_connection_id,))
+    c.execute(
+        "SELECT user_id FROM business_connections WHERE connection_id = ?",
+        (business_connection_id,),
+    )
     row = c.fetchone()
     return row[0] if row else None
+
+
+def get_owner_chat_id(conn, user_id):
+    """Get user's private chat ID for sending notifications"""
+    if not user_id:
+        return None
+    c = conn.cursor()
+    c.execute(
+        "SELECT chat_id FROM user_chats WHERE user_id = ?",
+        (user_id,),
+    )
+    row = c.fetchone()
+    return row[0] if row else None
+
+
+async def _delete_save_command(message, business_connection_id, context):
+    """Delete /чотам command message asynchronously (fire and forget)"""
+    try:
+        await context.bot.delete_business_messages(
+            business_connection_id=business_connection_id,
+            message_ids=[message.message_id],
+        )
+        print(f"✓ /чотам deleted immediately: message_id={message.message_id}")
+    except Exception as e:
+        if "Forbidden" not in str(e) and "message to delete not found" not in str(e).lower():
+            print(f"Note: Could not delete /чотам {message.message_id}: {e}")
 
 
 def format_text_block(text: str | None, empty_text: str = "Без текста") -> str:
@@ -21,6 +53,13 @@ def format_text_block(text: str | None, empty_text: str = "Без текста")
     if not value:
         value = empty_text
     return escape(value).replace("\n", "<br>")
+
+
+def is_delete_reply_command(text: str | None) -> bool:
+    command = ((text or "").strip().split(maxsplit=1) or [""])[0]
+    if not command.startswith("/"):
+        return False
+    return command.split("@", 1)[0].lower() in {"/del", "/delete", "/rm"}
 
 
 def build_card_message(
@@ -49,6 +88,7 @@ def build_card_message(
 
     return "\n\n".join(parts)
 
+
 async def handle_regular_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -67,17 +107,16 @@ async def handle_regular_message(update: Update, context: ContextTypes.DEFAULT_T
             username=update.message.from_user.username if update.message.from_user else None,
             sections=[("Текст", text)],
         ),
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
+
 
 async def handle_regular_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.edited_message:
         return
 
     owner_chat = update.edited_message.chat_id
-    # Проверяем, изменил ли сообщение сам владелец чата
     if update.edited_message.from_user and update.edited_message.from_user.id == owner_chat:
-        # Изменение от владельца — не отправляем уведомление
         return
 
     new_text = update.edited_message.text or "Без текста"
@@ -90,214 +129,192 @@ async def handle_regular_edited_message(update: Update, context: ContextTypes.DE
             username=update.edited_message.from_user.username if update.edited_message.from_user else None,
             sections=[("Новый текст", new_text)],
         ),
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
 
+
 async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик для business_connection: сохранение нового соединения в БД."""
     business_connection = update.business_connection
     if not business_connection:
         return
 
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect("database.db")
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
-                  (business_connection.id, business_connection.user.id, business_connection.date))
+        c.execute(
+            "INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
+            (business_connection.id, business_connection.user.id, business_connection.date),
+        )
         conn.commit()
-        print(f"✓ Saved business_connection: {business_connection.id} -> user {business_connection.user.id}")
+        print(f"Saved business_connection: {business_connection.id} -> user {business_connection.user.id}")
     except Exception as e:
         print(f"Error saving business connection: {e}")
     finally:
         conn.close()
 
+
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик для business_message: сохранение сообщения и скачивание медиафайлов."""
     business_message = update.business_message
     if not business_message:
         return
 
-    # Если это специальная команда для сохранения самоуничтожающегося сообщения,
-    # удаляем командное сообщение и продолжаем обработку, чтобы при ответе на медиа
-    # бот смог сохранить содержимое исходного сообщения.
-    if business_message.text and business_message.text.strip() == "/чотам" and getattr(business_message, 'reply_to_message', None):
-        await cleanup_save_command_message(business_message, context)
-
-    # бизнес-подключение может прийти в update.business_connection или только в message.business_connection_id
-    business_connection_id = None
-    if update.business_connection:
-        business_connection_id = update.business_connection.id
-        # Сохраняем business_connection в БД, если его нет
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        try:
-            c.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
-                      (business_connection_id, update.business_connection.user.id, business_message.date))
-            conn.commit()
-            print(f"✓ Saved business_connection from business_message: {business_connection_id} -> user {update.business_connection.user.id}")
-        except Exception as e:
-            print(f"Error saving business connection from business_message: {e}")
-        finally:
-            conn.close()
-    elif getattr(business_message, 'business_connection_id', None):
-        business_connection_id = business_message.business_connection_id
-
-        # Если записи в business_connections нет, создаем автоматом (fallback)
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        try:
-            existing_owner = get_owner_user_id(conn, business_connection_id)
-            if not existing_owner:
-                c.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
-                          (business_connection_id, business_message.chat.id, business_message.date))
-                conn.commit()
-                print(f"✓ Auto-saved business_connection from business_message: {business_connection_id} -> user {business_message.chat.id}")
-        except Exception as e:
-            print(f"Error auto-saving business connection from business_message: {e}")
-        finally:
-            conn.close()
-    else:
-        print('Warning: business_message received without business_connection, skipping')
+    business_connection_id = getattr(update.business_connection, "id", None) or getattr(
+        business_message, "business_connection_id", None
+    )
+    if not business_connection_id:
+        print("Warning: business_message received without business_connection, skipping")
         return
 
-    # Определение типа контента и file_id
-    content_type = 'text'
+    conn = sqlite3.connect("database.db")
+    owner_id = get_owner_user_id(conn, business_connection_id)
+    conn.close()
+
+    print(f"DEBUG: Received business_message for connection {business_connection_id}, owner_user_id={owner_id}")
+    
+    # Fallback: If owner not found in DB, get chat ID directly from message
+    # In Telegram Business API, business_message.chat.id is the owner's private chat
+    if owner_id is None:
+        print(f"DEBUG: Owner not in DB, using chat.id={business_message.chat.id} as fallback")
+        owner_chat_id = business_message.chat.id
+        owner_id = business_message.chat.id  # Use chat_id as owner_id for logging
+    else:
+        # Look up owner's private chat ID from database
+        conn = sqlite3.connect("database.db")
+        owner_chat_id = get_owner_chat_id(conn, owner_id)
+        conn.close()
+        if owner_chat_id is None:
+            # Fallback to chat.id if not found in DB
+            owner_chat_id = business_message.chat.id
+            print(f"DEBUG: Owner chat not in DB, using chat.id={business_message.chat.id} as fallback")
+
+    reply_to_message = getattr(business_message, "reply_to_message", None)
+    is_owner_message = bool(
+        business_message.from_user and business_message.from_user.id == owner_id
+    )
+    is_save_cmd = is_save_command(business_message.text)
+    
+    # Check if reply_to_message has protected content (View Once media)
+    has_protected_media = reply_to_message and getattr(reply_to_message, "has_protected_content", False)
+    
+    print(f"DEBUG: message_text='{business_message.text}', from_user_id={business_message.from_user.id if business_message.from_user else None}, is_owner_message={is_owner_message}, has_reply_to={reply_to_message is not None}, is_save_command={is_save_cmd}, has_protected_media={has_protected_media}")
+
+    # Delete /чотам command immediately (don't wait for it)
+    if is_save_cmd:
+        print(f"DEBUG: Scheduling immediate deletion of /чотам command message {business_message.message_id}...")
+        asyncio.create_task(_delete_save_command(business_message, business_connection_id, context))
+
+    # Determine if we should process the media:
+    # 1. If /чотам command with reply_to (explicit save with /чотам)
+    # 2. If reply to protected/View Once media (auto-save)
+    should_process_media = is_owner_message and reply_to_message and (is_save_cmd or has_protected_media)
+    source_message = reply_to_message if should_process_media else business_message
+
+    content_type = "text"
     file_id = None
-    is_from_reply = False
-    text = business_message.text or business_message.caption
+    text = source_message.text or source_message.caption
+    is_protected = getattr(source_message, "has_protected_content", False)
 
-    # Проверка на защищенный контент (View Once часто имеет этот флаг)
-    is_protected = getattr(business_message, 'has_protected_content', False)
-
-    if business_message.photo:
-        content_type = 'photo'
-        file_id = business_message.photo[-1].file_id  # Последнее фото (наивысшее качество)
-    elif business_message.document:
-        content_type = 'document'
-        file_id = business_message.document.file_id
-    elif business_message.audio:
-        content_type = 'audio'
-        file_id = business_message.audio.file_id
-    elif business_message.video:
-        content_type = 'video'
-        file_id = business_message.video.file_id
-    elif business_message.voice:
-        content_type = 'voice'
-        file_id = business_message.voice.file_id
-    elif business_message.video_note:
-        content_type = 'video_note'
-        file_id = business_message.video_note.file_id
-    elif business_message.sticker:
-        content_type = 'sticker'
-        file_id = business_message.sticker.file_id
-
-    # Если в самом сообщении нет файла, проверяем reply_to_message
-    # Это нужно, чтобы поймать View Once медиа при ответе на них
-    if not file_id and getattr(business_message, 'reply_to_message', None):
-        is_from_reply = True
-        reply = business_message.reply_to_message
-        # Обновляем статус защиты (он может быть True у оригинального сообщения)
-        is_protected = getattr(reply, 'has_protected_content', False)
-
-        if reply.photo:
-            content_type = 'photo'
-            file_id = reply.photo[-1].file_id
-        elif reply.document:
-            content_type = 'document'
-            file_id = reply.document.file_id
-        elif reply.audio:
-            content_type = 'audio'
-            file_id = reply.audio.file_id
-        elif reply.video:
-            content_type = 'video'
-            file_id = reply.video.file_id
-        elif reply.voice:
-            content_type = 'voice'
-            file_id = reply.voice.file_id
-        elif reply.video_note:
-            content_type = 'video_note'
-            file_id = reply.video_note.file_id
-        elif reply.sticker:
-            content_type = 'sticker'
-            file_id = reply.sticker.file_id
+    if source_message.photo:
+        content_type = "photo"
+        file_id = source_message.photo[-1].file_id
+    elif source_message.document:
+        content_type = "document"
+        file_id = source_message.document.file_id
+    elif source_message.audio:
+        content_type = "audio"
+        file_id = source_message.audio.file_id
+    elif source_message.video:
+        content_type = "video"
+        file_id = source_message.video.file_id
+    elif source_message.voice:
+        content_type = "voice"
+        file_id = source_message.voice.file_id
+    elif source_message.video_note:
+        content_type = "video_note"
+        file_id = source_message.video_note.file_id
+    elif source_message.sticker:
+        content_type = "sticker"
+        file_id = source_message.sticker.file_id
 
     file_path = None
     download_error = None
     if file_id:
         try:
             file = await context.bot.get_file(file_id)
-            # Генерация пути для сохранения
-            file_extension = os.path.splitext(file.file_path)[1] if file.file_path else ''
+            file_extension = os.path.splitext(file.file_path)[1] if file.file_path else ""
             file_path = f"storage/{file_id}{file_extension}"
-            os.makedirs('storage', exist_ok=True)
+            os.makedirs("storage", exist_ok=True)
             await file.download_to_drive(file_path)
         except Exception as e:
             print(f"Error downloading file {file_id}: {e}")
             download_error = str(e)
             file_path = None
 
-    # Сохранение в БД
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect("database.db")
     c = conn.cursor()
     try:
-        c.execute("""INSERT INTO messages (
-            business_connection_id, message_id, chat_id, from_user_id, content_type, text, file_id, file_path, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
-            business_connection_id, business_message.message_id, business_message.chat.id,
-            business_message.from_user.id if business_message.from_user else None,
-            content_type, text, file_id, file_path, business_message.date
-        ))
+        c.execute(
+            """INSERT INTO messages (
+                business_connection_id, message_id, chat_id, from_user_id, content_type, text, file_id, file_path, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                business_connection_id,
+                business_message.message_id,
+                business_message.chat.id,
+                business_message.from_user.id if business_message.from_user else None,
+                "text",
+                business_message.text or business_message.caption,
+                None,
+                None,
+                business_message.date,
+            ),
+        )
         conn.commit()
+        
+        # Use owner_chat_id that was already resolved above
+        
     except Exception as e:
         print(f"Error saving message: {e}")
     finally:
         conn.close()
 
-    # --- ЛОГИКА ПЕРЕСЫЛКИ (SAVE AIO LIKE) ---
-    conn = sqlite3.connect('database.db')
-    owner_id = get_owner_user_id(conn, business_connection_id)
-    conn.close()
+    if owner_chat_id and should_process_media:
+        sender = source_message.from_user or business_message.from_user
+        sender_name = sender.full_name if sender else None
 
-    # Пересылаем ТОЛЬКО если это ответ на медиа (ручное сохранение)
-    if owner_id and business_message.from_user and is_from_reply:
-        sender_name = business_message.from_user.full_name
-
-        # 1. Если файл успешно скачан — отправляем его
         if file_path and os.path.exists(file_path):
             try:
                 caption_text = build_card_message(
                     icon="📥",
                     title="Поймано медиа",
                     user_name=sender_name,
-                    username=business_message.from_user.username,
+                    username=sender.username if sender else None,
                     sections=[("Подпись", text)] if text else None,
                 )
 
-                with open(file_path, 'rb') as f:
-                    if content_type == 'photo':
-                        await context.bot.send_photo(chat_id=owner_id, photo=f, caption=caption_text, parse_mode='HTML')
-                    elif content_type == 'video':
-                        await context.bot.send_video(chat_id=owner_id, video=f, caption=caption_text, parse_mode='HTML')
-                    elif content_type == 'voice':
-                        await context.bot.send_voice(chat_id=owner_id, voice=f, caption=caption_text, parse_mode='HTML')
-                    elif content_type == 'video_note':
-                        await context.bot.send_video_note(chat_id=owner_id, video_note=f)
-                    elif content_type == 'audio':
-                         await context.bot.send_audio(chat_id=owner_id, audio=f, caption=caption_text, parse_mode='HTML')
-                    elif content_type == 'document':
-                         await context.bot.send_document(chat_id=owner_id, document=f, caption=caption_text, parse_mode='HTML')
-                    elif content_type == 'sticker':
-                         await context.bot.send_sticker(chat_id=owner_id, sticker=f)
+                with open(file_path, "rb") as f:
+                    if content_type == "photo":
+                        await context.bot.send_photo(chat_id=owner_chat_id, photo=f, caption=caption_text, parse_mode="HTML")
+                    elif content_type == "video":
+                        await context.bot.send_video(chat_id=owner_chat_id, video=f, caption=caption_text, parse_mode="HTML")
+                    elif content_type == "voice":
+                        await context.bot.send_voice(chat_id=owner_chat_id, voice=f, caption=caption_text, parse_mode="HTML")
+                    elif content_type == "video_note":
+                        await context.bot.send_video_note(chat_id=owner_chat_id, video_note=f)
+                    elif content_type == "audio":
+                        await context.bot.send_audio(chat_id=owner_chat_id, audio=f, caption=caption_text, parse_mode="HTML")
+                    elif content_type == "document":
+                        await context.bot.send_document(chat_id=owner_chat_id, document=f, caption=caption_text, parse_mode="HTML")
+                    elif content_type == "sticker":
+                        await context.bot.send_sticker(chat_id=owner_chat_id, sticker=f)
+                print(f"Sent saved {content_type} notification to owner user={owner_id}, chat={owner_chat_id}")
             except Exception as e:
-                # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
                 if "Forbidden" not in str(e):
                     print(f"Error forwarding media to owner: {e}")
-        
-        # 2. Если файл был, но скачать не удалось (например, защита View Once)
         elif file_id and download_error:
             try:
                 failure_reason = (
-                    "Файл защищён: Telegram API не даёт скачать такое view once медиа."
+                    "Файл защищен: Telegram API не дает скачать такое view once медиа."
                     if is_protected
                     else f"Ошибка загрузки: {download_error}"
                 )
@@ -309,18 +326,44 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                     icon="⚠️",
                     title="Медиа не сохранено",
                     user_name=sender_name,
-                    username=business_message.from_user.username,
+                    username=sender.username if sender else None,
                     sections=sections,
                 )
-                    
-                await context.bot.send_message(chat_id=owner_id, text=error_text, parse_mode='HTML')
+                await context.bot.send_message(chat_id=owner_chat_id, text=error_text, parse_mode="HTML")
+                print(f"Sent error notification (media failed) to owner user={owner_id}, chat={owner_chat_id}")
             except Exception as e:
-                # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
                 if "Forbidden" not in str(e):
                     print(f"Error sending error notification: {e}")
+        else:
+            try:
+                saved_text = build_card_message(
+                    icon="💾",
+                    title="Сохранено сообщение",
+                    user_name=sender_name,
+                    username=sender.username if sender else None,
+                    sections=[("Текст", text)],
+                )
+                await context.bot.send_message(chat_id=owner_chat_id, text=saved_text, parse_mode="HTML")
+                print(f"Sent saved text notification to owner user={owner_id}, chat={owner_chat_id}")
+            except Exception as e:
+                if "Forbidden" not in str(e):
+                    print(f"Error sending saved text message: {e}")
+
+    if (
+        is_owner_message
+        and reply_to_message is not None
+        and is_delete_reply_command(business_message.text)
+    ):
+        try:
+            await context.bot.delete_business_messages(
+                business_connection_id=business_connection_id,
+                message_ids=[reply_to_message.message_id, business_message.message_id],
+            )
+        except Exception as e:
+            print(f"Error deleting business messages via command: {e}")
+
 
 async def handle_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик для deleted_business_messages: отправка содержимого удалённых сообщений администратору."""
     deleted_event = update.deleted_business_messages
     if not deleted_event:
         return
@@ -329,116 +372,128 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     message_ids = deleted_event.message_ids
     event_chat_id = deleted_event.chat.id
 
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect("database.db")
     owner_id = get_owner_user_id(conn, business_connection_id)
     
-    # Если owner_id не найден, используем event_chat_id
-    if not owner_id:
-        owner_id = event_chat_id
-        print(f'Warning: owner_id not found for connection {business_connection_id}. Using event_chat_id {event_chat_id}')
+    # Fallback to chat.id if owner not in DB
+    if owner_id is None:
+        print(f"DEBUG: Owner not in DB for connection {business_connection_id}, using chat.id={event_chat_id}")
+        notify_chat_id = event_chat_id
+    else:
+        # Look up owner's private chat ID from database
+        notify_chat_id = get_owner_chat_id(conn, owner_id) if owner_id else None
+        if notify_chat_id is None:
+            # Fallback to chat.id
+            notify_chat_id = event_chat_id
+            print(f"DEBUG: Owner chat not in DB, using chat.id={event_chat_id}")
     
+    print(f"Sending delete notifications to owner user={owner_id}, chat={notify_chat_id}")
     c = conn.cursor()
 
     try:
         for msg_id in message_ids:
-            # Ищем удаляемое сообщение в нашей базе данных
-            c.execute("SELECT content_type, text, file_path, chat_id, from_user_id FROM messages WHERE business_connection_id = ? AND message_id = ?",
-                      (business_connection_id, msg_id))
+            c.execute(
+                "SELECT content_type, text, file_path, chat_id, from_user_id FROM messages WHERE business_connection_id = ? AND message_id = ?",
+                (business_connection_id, msg_id),
+            )
             row = c.fetchone()
 
-            # Отправляем уведомление владельцу бота
-            target_chat = owner_id
+            if not row:
+                print(f"Message {msg_id} not found in DB for deletion (skipped).")
+                continue
 
-            if row:
-                content_type, text, file_path, db_chat_id, from_user_id = row
+            content_type, text, file_path, db_chat_id, from_user_id = row
 
-                # Получаем информацию о пользователе для красивого уведомления
-                user_name = "Неизвестный"
-                user_handle_str = ""
-                button_url = None
+            user_name = "Неизвестный"
+            user_handle_str = ""
+            button_url = None
 
-                if from_user_id:
-                    try:
-                        chat_info = await context.bot.get_chat(from_user_id)
-                        user_name = chat_info.full_name
-                        if chat_info.username:
-                            user_handle_str = chat_info.username
-                            button_url = f"https://t.me/{chat_info.username}"
-                        else:
-                            button_url = f"tg://user?id={from_user_id}"
-                    except Exception:
-                        user_name = "Пользователь"
+            if from_user_id:
+                try:
+                    chat_info = await context.bot.get_chat(from_user_id)
+                    user_name = chat_info.full_name
+                    if chat_info.username:
+                        user_handle_str = chat_info.username
+                        button_url = f"https://t.me/{chat_info.username}"
+                    else:
                         button_url = f"tg://user?id={from_user_id}"
+                except Exception:
+                    user_name = "Пользователь"
+                    button_url = f"tg://user?id={from_user_id}"
 
-                text_to_send = build_card_message(
-                    icon="♻️",
-                    title="Сообщение удалено",
-                    user_name=user_name,
-                    username=user_handle_str or None,
-                    sections=[("Удалённый текст", text or "Только медиа")],
+            text_to_send = build_card_message(
+                icon="♻️",
+                title="Сообщение удалено",
+                user_name=user_name,
+                username=user_handle_str or None,
+                sections=[("Удаленный текст", text or "Только медиа")],
+            )
+
+            reply_markup = None
+            if button_url:
+                reply_markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]]
                 )
 
-                reply_markup = None
-                if button_url:
-                    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
+            try:
+                if file_path and os.path.exists(file_path):
+                    with open(file_path, "rb") as f:
+                        if content_type == "photo":
+                            await context.bot.send_photo(chat_id=notify_chat_id, photo=f, caption=text_to_send, parse_mode="HTML", reply_markup=reply_markup)
+                        elif content_type == "video":
+                            await context.bot.send_video(chat_id=notify_chat_id, video=f, caption=text_to_send, parse_mode="HTML", reply_markup=reply_markup)
+                        elif content_type == "voice":
+                            await context.bot.send_voice(chat_id=notify_chat_id, voice=f, caption=text_to_send, parse_mode="HTML", reply_markup=reply_markup)
+                        else:
+                            await context.bot.send_document(chat_id=notify_chat_id, document=f, caption=text_to_send, parse_mode="HTML", reply_markup=reply_markup)
+                    print(f"Sent deleted {content_type} notification to owner user={owner_id}, chat={notify_chat_id}")
+                else:
+                    await context.bot.send_message(chat_id=notify_chat_id, text=text_to_send, parse_mode="HTML", reply_markup=reply_markup)
+                    print(f"Sent deleted message notification to owner user={owner_id}, chat={notify_chat_id}")
+            except Exception as e:
+                # Silently ignore Forbidden errors - expected when bot can't initiate conversation
+                # User must start bot first via /start for notifications to work
+                if "Forbidden" not in str(e):
+                    print(f"Error notifying chat {notify_chat_id}: {e}")
 
-                # Отправка владельцу бота на приватный чат
-                try:
-                    if file_path and os.path.exists(file_path):
-                        with open(file_path, 'rb') as f:
-                            if content_type == 'photo':
-                                await context.bot.send_photo(chat_id=target_chat, photo=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
-                            elif content_type == 'video':
-                                await context.bot.send_video(chat_id=target_chat, video=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
-                            elif content_type == 'voice':
-                                await context.bot.send_voice(chat_id=target_chat, voice=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
-                            else:
-                                await context.bot.send_document(chat_id=target_chat, document=f, caption=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
-                    else:
-                        await context.bot.send_message(chat_id=target_chat, text=text_to_send, parse_mode='HTML', reply_markup=reply_markup)
-                except Exception as e:
-                    # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
-                    if "Forbidden" not in str(e):
-                        print(f"Error notifying owner: {e}")
+            c.execute(
+                "UPDATE messages SET is_deleted = 1 WHERE business_connection_id = ? AND message_id = ?",
+                (business_connection_id, msg_id),
+            )
 
-                c.execute("UPDATE messages SET is_deleted = 1 WHERE business_connection_id = ? AND message_id = ?", (business_connection_id, msg_id))
-            else:
-                # Сообщения нет в базе (возможно, оно было отправлено до установки бота)
-                # Мы не можем его переслать, так как у нас нет его содержимого.
-                print(f"Message {msg_id} not found in DB for deletion (skipped).")
-        
         conn.commit()
     except Exception as e:
         print(f"Error handling deleted messages: {e}")
     finally:
         conn.close()
 
+
 async def handle_edited_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик для edited_business_message: сохранение истории правок и уведомление администратора."""
     edited_message = update.edited_business_message
     if not edited_message:
         return
-    
-    # Пытаемся получить ID соединения из разных мест
-    business_connection_id = getattr(update.business_connection, 'id', None) or getattr(edited_message, 'business_connection_id', None)
 
+    business_connection_id = getattr(update.business_connection, "id", None) or getattr(
+        edited_message, "business_connection_id", None
+    )
     if not business_connection_id:
-        print('Warning: edited_business_message received without business_connection, skipping')
+        print("Warning: edited_business_message received without business_connection, skipping")
         return
 
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect("database.db")
     c = conn.cursor()
     try:
-        # Найти оригинальное сообщение
-        c.execute("SELECT text, file_id, chat_id, edit_count FROM messages WHERE business_connection_id = ? AND message_id = ?",
-                  (business_connection_id, edited_message.message_id))
+        c.execute(
+            "SELECT text, file_id, chat_id, edit_count FROM messages WHERE business_connection_id = ? AND message_id = ?",
+            (business_connection_id, edited_message.message_id),
+        )
         row = c.fetchone()
         if not row:
+            conn.close()
             return
 
         old_text, old_file_id, chat_id, edit_count = row
 
-        # Новая версия
         new_text = edited_message.text or edited_message.caption
         new_file_id = None
         if edited_message.photo:
@@ -456,44 +511,42 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
         elif edited_message.sticker:
             new_file_id = edited_message.sticker.file_id
 
-        # Сохранить старую версию в message_edits
-        c.execute("""INSERT INTO message_edits (
-            message_id, chat_id, old_text, new_text, old_file_id, new_file_id, edited_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)""", (
-            edited_message.message_id, chat_id, old_text, new_text, old_file_id, new_file_id, edited_message.edit_date
-        ))
+        c.execute(
+            """INSERT INTO message_edits (
+                message_id, chat_id, old_text, new_text, old_file_id, new_file_id, edited_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                edited_message.message_id,
+                chat_id,
+                old_text,
+                new_text,
+                old_file_id,
+                new_file_id,
+                edited_message.edit_date,
+            ),
+        )
 
-        # Обновить оригинальное сообщение
         new_edit_count = (edit_count or 0) + 1
-        c.execute("UPDATE messages SET text = ?, file_id = ?, edit_count = ? WHERE business_connection_id = ? AND message_id = ?",
-                  (new_text, new_file_id, new_edit_count, business_connection_id, edited_message.message_id))
+        c.execute(
+            "UPDATE messages SET text = ?, file_id = ?, edit_count = ? WHERE business_connection_id = ? AND message_id = ?",
+            (new_text, new_file_id, new_edit_count, business_connection_id, edited_message.message_id),
+        )
         conn.commit()
 
-        # Получить ID владельца для проверки (не изменил ли он сам)
         owner_id = get_owner_user_id(conn, business_connection_id)
+        # Get owner's private chat ID for notifications
+        target_chat = get_owner_chat_id(conn, owner_id) if owner_id else None
         
-        # Если owner_id не найден, используем event_chat_id и сохраняем fallback
-        if not owner_id:
-            owner_id = edited_message.chat.id
-            try:
-                c.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id, connected_at) VALUES (?, ?, ?)",
-                          (business_connection_id, owner_id, edited_message.date))
-                conn.commit()
-                print(f"Warning: owner_id not found for connection {business_connection_id}. Auto-saved to {owner_id}")
-            except Exception as e:
-                print(f"Error auto-saving connection in edited_business_message: {e}")
+        # Fallback: use chat.id from edited_message if owner not in DB
+        if target_chat is None:
+            target_chat = edited_message.chat.id
+            print(f"DEBUG: Owner not found or chat not in DB, using chat.id={target_chat} as fallback")
+        
+        print(f"Sending edit notification to owner user={owner_id}, chat={target_chat}")
 
-        # Проверяем, изменил ли сообщение владелец бота (себя)
-        if edited_message.from_user and edited_message.from_user.id == owner_id:
-            # Изменение от владельца — не отправляем уведомление
-            return
-
-        # Отправляем уведомление владельцу бота на его приватный чат
-        target_chat = owner_id
-
-        user_name = edited_message.from_user.full_name if edited_message.from_user else 'Неизвестный'
-        username = edited_message.from_user.username
-        timestamp = edited_message.edit_date.strftime('%H:%M') if edited_message.edit_date else None
+        user_name = edited_message.from_user.full_name if edited_message.from_user else "Неизвестный"
+        username = edited_message.from_user.username if edited_message.from_user else None
+        timestamp = edited_message.edit_date.strftime("%H:%M") if edited_message.edit_date else None
 
         notification_text = build_card_message(
             icon="♻️",
@@ -507,17 +560,24 @@ async def handle_edited_business_message(update: Update, context: ContextTypes.D
             footer=timestamp,
         )
 
-        # Кнопка перехода в чат
-        button_url = f"https://t.me/{username}" if username else f"tg://user?id={edited_message.from_user.id}"
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]])
+        button_url = f"https://t.me/{username}" if username else None
+        if not button_url and edited_message.from_user:
+            button_url = f"tg://user?id={edited_message.from_user.id}"
 
-        # Отправляем в приватный чат владельца
+        reply_markup = None
+        if button_url:
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💬 Перейти в чат", url=button_url)]]
+            )
+
         try:
-            await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='HTML', reply_markup=reply_markup)
+            await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode="HTML", reply_markup=reply_markup)
+            print(f"Sent edit notification to owner user={owner_id}, chat={target_chat}")
         except Exception as ex:
-            # Игнорируем Forbidden ошибки (бот не может инициировать разговор)
+            # Silently ignore Forbidden errors - expected when bot can't initiate conversation
+            # User must start bot first via /start for notifications to work
             if "Forbidden" not in str(ex):
-                print(f"Error sending edit notification: {ex}")
+                print(f"Error sending edit notification to chat {target_chat}: {ex}")
 
     except Exception as e:
         print(f"Error handling edited message: {e}")

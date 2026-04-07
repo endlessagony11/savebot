@@ -29,6 +29,7 @@ from handlers.admin import (
     diff_command,
     start_command,
     help_callback_handler,
+    save_instruction_callback_handler,
     stats_command
 )
 from database.models import init_db
@@ -91,6 +92,7 @@ def main():
     # Регистрация команд администратора
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(help_callback_handler, pattern='^help_instruction$'))
+    app.add_handler(CallbackQueryHandler(save_instruction_callback_handler, pattern='^save_instruction$'))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("deleted", deleted_command))
     app.add_handler(CommandHandler("connections", connections_command))

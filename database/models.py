@@ -33,5 +33,10 @@ def init_db():
         new_file_id TEXT,
         edited_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_chats (
+        user_id INTEGER PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
     conn.commit()
     conn.close()

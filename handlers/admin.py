@@ -7,6 +7,23 @@ from telegram.ext import ContextTypes
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /start — Приветственное меню."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Save user's private chat ID for sending notifications
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO user_chats (user_id, chat_id) VALUES (?, ?)",
+            (user_id, chat_id)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving user chat: {e}")
+    finally:
+        conn.close()
+    
     user_name = update.effective_user.first_name
     text = (
         f"👋 <b>Привет, {user_name}!</b>\n\n"
@@ -21,7 +38,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Я уведомлю тебя, если кто-то удалит сообщение в чате."
     )
     
-    keyboard = [[InlineKeyboardButton("📚 Инструкция по подключению", callback_data='help_instruction')]]
+    keyboard = [
+        [InlineKeyboardButton("📚 Инструкция по подключению", callback_data='help_instruction')],
+        [InlineKeyboardButton("💾 Как сохранить View Once", callback_data='save_instruction')]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
@@ -39,6 +59,25 @@ async def help_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         "4. Готово! Бот начнет сохранять сообщения из личных чатов."
     )
     await query.message.reply_text(help_text, parse_mode='HTML')
+
+async def save_instruction_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик нажатия на кнопку инструкции по сохранению View Once."""
+    query = update.callback_query
+    await query.answer()
+    
+    save_text = (
+        "💾 <b>Как сохранить View Once сообщение:</b>\n\n"
+        "🔥 <b>Автоматическое сохранение:</b>\n"
+        "Просто <b>ответьте</b> на View Once фото/видео любым текстом — я автоматически сохраню копию и отправлю вам уведомление.\n\n"
+        "📝 <b>Команда /чотам:</b>\n"
+        "Ответьте на любое сообщение командой <code>/чотам</code> — я сохраню его и <b>сразу удалю команду</b>.\n\n"
+        "⚡ <b>Примеры:</b>\n"
+        "• Ответьте на View Once: \"сохрани\"\n"
+        "• Ответьте на сообщение: \"/чотам\"\n\n"
+        "Я отправлю вам копию в личный чат с ботом!\n\n"
+        "P.S Советую отправлять сообщение без звука🤫"
+    )
+    await query.message.reply_text(save_text, parse_mode='HTML')
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /history {chat_id} — показать историю переписки."""
