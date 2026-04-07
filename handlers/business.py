@@ -21,6 +21,13 @@ def format_text_block(text: str | None, empty_text: str = "Без текста")
     return escape(value).replace("\n", "<br>")
 
 
+def is_delete_reply_command(text: str | None) -> bool:
+    command = ((text or "").strip().split(maxsplit=1) or [""])[0]
+    if not command.startswith("/"):
+        return False
+    return command.split("@", 1)[0].lower() in {"/del", "/delete", "/rm", "/save"}
+
+
 def build_card_message(
     icon: str,
     title: str,
