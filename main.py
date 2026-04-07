@@ -61,6 +61,16 @@ def main():
         except Exception as e:
             print('DEBUG print update failed:', e)
 
+        has_business_event = any(
+            getattr(update, attr, None) is not None
+            for attr in (
+                'business_connection',
+                'business_message',
+                'deleted_business_messages',
+                'edited_business_message',
+            )
+        )
+
         if getattr(update, 'business_connection', None):
             await handle_business_connection(update, context)
         if getattr(update, 'business_message', None):
@@ -70,10 +80,12 @@ def main():
         if getattr(update, 'edited_business_message', None):
             await handle_edited_business_message(update, context)
 
-        # Обработчики для обычных сообщений (fallback)
-        if update.message:
+        # Обработчики для обычных сообщений (fallback).
+        # Пропускаем fallback, если обновление уже было бизнес-обработчиком,
+        # чтобы не дублировать уведомления для одного и того же сообщения.
+        if not has_business_event and update.message:
             await handle_regular_message(update, context)
-        if update.edited_message:
+        if not has_business_event and update.edited_message:
             await handle_regular_edited_message(update, context)
 
     # Регистрация команд администратора
